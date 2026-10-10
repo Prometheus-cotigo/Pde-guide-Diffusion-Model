@@ -18,11 +18,12 @@ load(modelFileName);
 %% ------------------------------------------------------------
 % [Part 1] Setup Inference
 % ------------------------------------------------------------
-target_nu = 0.0075; 
+target_nu = 0.0075;
+guidanceMode = 'stable_energy'; % 'stable_energy' | 'legacy_residual' 
 fprintf('Starting Inference for Target Nu = %.4f...\n', target_nu);
 
 % Save directory
-saveDir = 'inference_snapshots_burgers';
+saveDir = ['inference_snapshots_burgers_' guidanceMode];
 if ~exist(saveDir, 'dir')
     mkdir(saveDir);
 end
@@ -41,9 +42,24 @@ Lxx = spdiags([ones(Nx,1) -2*ones(Nx,1) ones(Nx,1)], -1:1, Nx, Nx);
 Dxx = Lxx / (dx^2);
 Bt = spdiags([-ones(Nt,1) zeros(Nt,1) ones(Nt,1)], -1:1, Nt, Nt);
 Bt(1, 1:2) = [-1, 1]; Bt(end, end-1:end) = [-1, 1];
-Dt = Bt / (2*dt);
+DtLegacy = Bt / (2*dt); % Retain the original one-sided stencil for ablation.
+Bt(1, 1:2) = [-2, 2]; Bt(end, end-1:end) = [-2, 2];
+Dt = Bt / (2*dt); % Correct endpoint derivative for the energy-based mode.
 
-dtPhys = 0.00350; % Physics guidance step size
+dtPhys = 0.00350; % Initial trial update size in normalized solution units.
+maxBacktracks = 12;
+armijoFactor = 1e-4;
+gradientClipRms = 5;
+if Nx < 3 || Nt < 3 || ~isfinite(dx) || dx <= 0 || ~isfinite(dt) || dt <= 0 ...
+        || ~isfinite(scaleFactor) || scaleFactor == 0 || ~isfinite(target_nu) || target_nu <= 0
+    error('Invalid spatial/time grid, normalization scale or viscosity.');
+end
+if ~ismember(guidanceMode, {'stable_energy', 'legacy_residual'})
+    error('Unsupported guidanceMode: %s', guidanceMode);
+end
+validMask = false(Nt,Nx);
+validMask(2:end,2:end-1) = true; % Interior x, time rows t > 0.
+guidanceTrace = nan(numT,5); % [PDE RMS before, after, accepted step, accepted, trials]
 
 %% ------------------------------------------------------------
 % [Part 2] Reverse Diffusion Loop
@@ -78,29 +94,43 @@ for t = numT:-1:1
     eps_pred_gd = double(squeeze(eps_pred_gd));
     u_guided_pre = (u_guided - beta(t)/sqrt(1-alphaBar(t))*eps_pred_gd) / sqrt(alpha(t)) + sqrt(beta(t))*z;
     
-    % B. Physcis-Guide Step
-    u_phys_temp = u_guided_pre;
-    u_real = u_phys_temp * scaleFactor;
-    u_smooth = imgaussfilt(u_real, 0.9); 
-    
-    term_ut = Dt * u_smooth;
-    term_ux = u_smooth * Dx';
-    term_uxx = u_smooth * Dxx';
-    
-    % Burgers Residual: u_t + u*u_x - nu*u_xx
-    phys_res = term_ut + (u_smooth .* term_ux) - (target_nu * term_uxx);
-    res_norm = phys_res / scaleFactor;
-    res_norm(1, :) = 0; % Ignore t=0
-    
-    u_phys_temp = u_phys_temp - dtPhys * res_norm;
-    
-    % C. BCs/ICs Enforcement
-    u_phys_temp(:, 1) = 0;      
-    u_phys_temp(:, end) = 0;    
-    u_phys_temp(1, :) = u0_true_norm; 
-    
-    u_guided = u_phys_temp;
-    
+    % B. Stable physics correction (or exact legacy correction).
+    if ~all(isfinite(u_guided_pre(:)))
+        error('Non-finite guided denoising field at reverse step %d.', t);
+    end
+    if strcmp(guidanceMode, 'stable_energy')
+        u_projected = enforceBurgersConstraints(u_guided_pre, u0_true_norm);
+        [u_guided, energyBefore, energyAfter, acceptedStep, accepted, trials] = ...
+            stableBurgersCorrection(u_projected, Dt, Dx, Dxx, target_nu, ...
+                scaleFactor, validMask, dtPhys, maxBacktracks, ...
+                armijoFactor, gradientClipRms);
+        guidanceTrace(t,:) = [sqrt(2*energyBefore), sqrt(2*energyAfter), ...
+            acceptedStep, double(accepted), trials];
+        if mod(t,50) == 0 || t == 1
+            fprintf('  Physics t=%d | PDE RMS %.4g -> %.4g | step %.3g | accepted %d/%d\n', ...
+                t, guidanceTrace(t,1), guidanceTrace(t,2), acceptedStep, accepted, trials);
+        end
+    else
+        % Preserve original residual-subtraction update, smoothing, and stencil.
+        u_phys_temp = u_guided_pre;
+        u_real = u_phys_temp * scaleFactor;
+        u_smooth = imgaussfilt(u_real, 0.9);
+        term_ut = DtLegacy * u_smooth;
+        term_ux = u_smooth * Dx';
+        term_uxx = u_smooth * Dxx';
+        phys_res = term_ut + (u_smooth .* term_ux) - (target_nu * term_uxx);
+        res_norm = phys_res / scaleFactor;
+        res_norm(1,:) = 0;
+        u_phys_temp = u_phys_temp - dtPhys * res_norm;
+        u_phys_temp(:,1) = 0;
+        u_phys_temp(:,end) = 0;
+        u_phys_temp(1,:) = u0_true_norm;
+        u_guided = u_phys_temp;
+    end
+    if ~all(isfinite(u_guided(:))) || ~all(isfinite(u_unguided(:)))
+        error('Non-finite generated field at reverse step %d.', t);
+    end
+
     % --- Save Snapshots ---
     if mod(t, 50) == 0 || t == 1
         hTemp = figure('Visible', 'off', 'Position', [0, 0, 512, 512], 'Color', 'w');
@@ -128,6 +158,11 @@ for t = numT:-1:1
         drawnow;
     end
 end
+if strcmp(guidanceMode, 'stable_energy')
+    fprintf('\nStable guidance: %d/%d corrections accepted, %d skipped.\n', ...
+        sum(guidanceTrace(:,4)), numT, numT-sum(guidanceTrace(:,4)));
+    fprintf('PDE RMS here excludes the initial-time row and spatial endpoints.\n');
+end
 u_final_guided = u_guided * scaleFactor;
 u_final_unguided = u_unguided * scaleFactor;
 
@@ -152,6 +187,11 @@ rel_err_unguided = norm(u_final_unguided(:) - u_true(:)) / norm(u_true(:));
 fprintf('\nFinal Metrics:\n');
 fprintf('  > Unguided Rel Error: %.4f\n', rel_err_unguided);
 fprintf('  > Guided   Rel Error: %.4f\n', rel_err_guided);
+if strcmp(guidanceMode, 'stable_energy')
+    save(fullfile(saveDir, sprintf('stability_trace_nu_%.4f.mat',target_nu)), ...
+        'guidanceTrace','target_nu','guidanceMode','dtPhys', ...
+        'rel_err_guided','rel_err_unguided');
+end
 
 figure('Name', 'Core Analysis: Burgers Final', 'Position', [50, 50, 1600, 900]);
 clim_data = [min(u_true(:)), max(u_true(:))];
@@ -216,4 +256,65 @@ end
 function [pl,ql,pr,qr] = burgersBC_fixed(xl,ul,xr,ur,t)
     pl = ul; ql = 0;
     pr = ur; qr = 0;
+end
+% -------------------------------------------------------------------------
+% Experimental stable correction: reduce discrete UNSMOOTHED PDE residual.
+% This DOES NOT guarantee better accuracy against the pdepe reference.
+% -------------------------------------------------------------------------
+function [uNew, E0, Enew, acceptedStep, accepted, trials] = ...
+    stableBurgersCorrection(u, Dt, Dx, Dxx, nu, scaleFactor, ...
+        validMask, initialStep, maxBacktracks, armijoFactor, gradientClipRms)
+    [E0, grad] = burgersEnergyAndGradient(u, Dt, Dx, Dxx, nu, scaleFactor, validMask);
+    if ~isfinite(E0) || ~all(isfinite(grad(:)))
+        error('Non-finite PDE energy or gradient before correction.');
+    end
+    uNew = u; Enew = E0; acceptedStep = 0; accepted = false; trials = 0;
+    gradRms = sqrt(mean(grad(validMask).^2));
+    if E0 <= eps || gradRms <= 1e-12
+        return;
+    end
+    % Rescale the steepest-descent direction and clip extreme entries.
+    direction = grad / gradRms;
+    direction = max(-gradientClipRms, min(gradientClipRms, direction));
+    directionalDerivative = sum(grad(:).*direction(:));
+    if ~isfinite(directionalDerivative) || directionalDerivative <= 0
+        return;
+    end
+    step = initialStep;
+    for j = 1:maxBacktracks
+        trials = j;
+        candidate = u - step*direction;
+        trialEnergy = burgersEnergyAndGradient(candidate, Dt, Dx, Dxx, ...
+            nu, scaleFactor, validMask);
+        if isfinite(trialEnergy) && ...
+                trialEnergy <= E0 - armijoFactor*step*directionalDerivative
+            uNew = candidate;
+            Enew = trialEnergy;
+            acceptedStep = step;
+            accepted = true;
+            return;
+        end
+        step = 0.5*step;
+    end
+    % If every trial fails, retain the constraint-projected denoiser output.
+end
+
+function [E, grad] = burgersEnergyAndGradient(u, Dt, Dx, Dxx, nu, scaleFactor, validMask)
+    ux = u*Dx';
+    % For u_real = scaleFactor*u, r = R(u_real)/scaleFactor.
+    r = Dt*u + scaleFactor*(u.*ux) - nu*(u*Dxx');
+    r(~validMask) = 0;
+    N = nnz(validMask);
+    E = 0.5*sum(r(:).^2)/N;
+    if nargout > 1
+        % Exact discrete Jacobian-transpose residual (w.r.t. normalized u).
+        grad = (Dt'*r + scaleFactor*(r.*ux + (r.*u)*Dx) - nu*(r*Dxx))/N;
+        grad(~validMask) = 0; % No updates to constrained initial/boundary nodes.
+    end
+end
+
+function u = enforceBurgersConstraints(u, u0_true_norm)
+    u(:,1) = 0;
+    u(:,end) = 0;
+    u(1,:) = u0_true_norm;
 end
